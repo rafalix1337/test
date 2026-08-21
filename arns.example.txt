@@ -1,0 +1,21 @@
+# Example input for arn_delete.py — copy to arns.txt and edit.
+#
+# One ARN per line. '#' starts a comment, blank lines are ignored.
+# JSON (including `aws resourcegroupstaggingapi get-resources` output) also works
+# and is auto-detected; see README.md -> Input formats.
+#
+# Inspect first:   python arn_delete.py arns.txt --check
+# Then delete:     python arn_delete.py arns.txt --execute
+
+arn:aws:ec2:eu-central-1:111122223333:instance/i-0abc1234567890def
+arn:aws:rds:eu-central-1:111122223333:db:sandbox-db-1
+arn:aws:s3:::sandbox-artifacts-111122223333
+arn:aws:lambda:eu-central-1:111122223333:function:sandbox-worker
+arn:aws:logs:eu-central-1:111122223333:log-group:/aws/lambda/sandbox-worker:*
+
+# Order does not matter here — the script sorts leaf resources before the
+# infrastructure they depend on, so a VPC is always deleted after its subnets
+# and security groups.
+arn:aws:ec2:eu-central-1:111122223333:security-group/sg-0abc1234567890def
+arn:aws:ec2:eu-central-1:111122223333:subnet/subnet-0abc1234567890def
+arn:aws:ec2:eu-central-1:111122223333:vpc/vpc-0abc1234567890def

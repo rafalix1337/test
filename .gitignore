@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Real teardown lists — keep only arns.example.txt in git.
+arns.txt
+*.arns.txt
