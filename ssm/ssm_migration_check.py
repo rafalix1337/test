@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Read-only audit of AWS Systems Manager configuration that breaks when an
-account is moved from one AWS Organization to another.
+"""Read-only audit of AWS Systems Manager configuration that MUST be addressed
+before moving an account to a different AWS Organization.
 
-SSM documents themselves survive the move: they are account-scoped and the
-account ID does not change. What breaks is everything wired to the *organization*
-- SCPs, aws:PrincipalOrgID conditions, service-managed StackSets, org-wide
-Resource Data Syncs and delegated administrators.
+Reporting rule: a finding is emitted only when the script has read the actual
+resource and can point at the evidence. No naming-convention guesses, no "you
+might want to check X". Anything the script could not read is reported as
+UNCHECKED - a blind spot, never as a pass.
 
-This script only calls Describe/Get/List APIs. It never mutates anything.
+SSM documents themselves survive the move untouched: they are account-scoped and
+the account ID does not change. What breaks is configuration pinned to the
+organization, which is what this audits.
+
+Only Describe/Get/List calls. Nothing is mutated.
 """
 
 from __future__ import annotations
@@ -37,9 +41,10 @@ ORG_CONDITION_KEYS = (
 )
 
 SSM_ENDPOINT_SUFFIXES = (".ssm", ".ssmmessages", ".ec2messages")
-QUICK_SETUP_PREFIXES = ("AWS-QuickSetup", "AWSQuickSetup")
 
-SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+MUST_FIX = "MUST-FIX"
+UNCHECKED = "UNCHECKED"
+SEVERITY_ORDER = {MUST_FIX: 0, UNCHECKED: 1}
 
 
 @dataclass
@@ -48,21 +53,21 @@ class Finding:
     check: str
     region: str
     resource: str
-    detail: str
+    evidence: str
     action: str
 
 
 def org_references(blob: Any) -> list[str]:
-    """Return human-readable reasons why `blob` is tied to the current org."""
+    """Return the concrete tokens that tie `blob` to the current organization."""
     text = blob if isinstance(blob, str) else json.dumps(blob)
     reasons: list[str] = []
     for key in ORG_CONDITION_KEYS:
         if key in text:
-            reasons.append(f"condition key {key}")
+            reasons.append(key)
     for org_id in sorted(set(ORG_ID_RE.findall(text))):
-        reasons.append(f"organization id {org_id}")
+        reasons.append(org_id)
     for ou_id in sorted(set(OU_ID_RE.findall(text))):
-        reasons.append(f"organizational unit {ou_id}")
+        reasons.append(ou_id)
     return reasons
 
 
@@ -73,9 +78,10 @@ class Auditor:
         self.verbose = verbose
         self.findings: list[Finding] = []
         self._clients: dict[str, Any] = {}
+        self._seen_targets: set[str] = set()
         self.account_id = ""
         self.org_id = ""
-        self.org_account_ids: set[str] = set()
+        self.document_count = 0
 
     # -- plumbing ---------------------------------------------------------
 
@@ -84,21 +90,20 @@ class Auditor:
             self._clients[name] = self.session.client(name, region_name=self.region)
         return self._clients[name]
 
-    def add(self, severity: str, check: str, resource: str, detail: str, action: str) -> None:
-        self.findings.append(
-            Finding(severity, check, self.region, resource, detail, action)
-        )
+    def add(self, severity: str, check: str, resource: str, evidence: str, action: str) -> None:
+        self.findings.append(Finding(severity, check, self.region, resource, evidence, action))
 
-    def skipped(self, check: str, err: Exception) -> None:
+    def unchecked(self, check: str, resource: str, err: Exception) -> None:
         code = ""
         if isinstance(err, ClientError):
             code = err.response.get("Error", {}).get("Code", "")
         self.add(
-            "INFO",
+            UNCHECKED,
             check,
-            "-",
-            f"check skipped: {code or type(err).__name__}: {err}",
-            "re-run with credentials that allow this call to get full coverage",
+            resource,
+            f"{code or type(err).__name__}: {err}",
+            "re-run with credentials that allow this call - this is a blind spot, "
+            "not a pass",
         )
 
     def log(self, message: str) -> None:
@@ -106,12 +111,9 @@ class Auditor:
             print(f"  .. {message}", file=sys.stderr)
 
     def paginate(self, client_name: str, operation: str, key: str, **kwargs) -> Iterable[dict]:
-        client = self.client(client_name)
-        paginator = client.get_paginator(operation)
+        paginator = self.client(client_name).get_paginator(operation)
         for page in paginator.paginate(**kwargs):
             yield from page.get(key, [])
-
-    # -- context ----------------------------------------------------------
 
     def load_context(self) -> None:
         try:
@@ -119,30 +121,67 @@ class Auditor:
         except (ClientError, BotoCoreError) as err:
             raise SystemExit(f"cannot resolve caller identity in {self.region}: {err}")
         try:
-            org = self.client("organizations").describe_organization()["Organization"]
-            self.org_id = org["Id"]
-            management_account = org["MasterAccountId"]
-            role = "management account" if management_account == self.account_id else "member account"
-            self.add(
-                "INFO",
-                "organization",
-                f"account {self.account_id}",
-                f"currently a {role} of {self.org_id} (management account {management_account})",
-                "account id stays the same after the move; organization id does not",
-            )
-        except (ClientError, BotoCoreError) as err:
-            self.skipped("organization", err)
-        try:
-            self.org_account_ids = {
-                a["Id"] for a in self.paginate("organizations", "list_accounts", "Accounts")
-            }
+            self.org_id = self.client("organizations").describe_organization()["Organization"]["Id"]
         except (ClientError, BotoCoreError):
-            pass  # member accounts cannot list; sharing check degrades gracefully
+            self.org_id = ""  # header metadata only, not a check
+
+    # -- shared policy inspection -----------------------------------------
+
+    def check_bucket_policy(self, bucket: str, used_for: str) -> None:
+        if f"s3:{bucket}" in self._seen_targets:
+            return
+        self._seen_targets.add(f"s3:{bucket}")
+        try:
+            policy = self.client("s3").get_bucket_policy(Bucket=bucket)["Policy"]
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") == "NoSuchBucketPolicy":
+                return  # no policy means no org condition - a real pass
+            self.unchecked("bucket-policy", f"s3://{bucket}", err)
+            return
+        except BotoCoreError as err:
+            self.unchecked("bucket-policy", f"s3://{bucket}", err)
+            return
+
+        reasons = org_references(policy)
+        if reasons:
+            self.add(
+                MUST_FIX,
+                "bucket-policy",
+                f"s3://{bucket}",
+                f"{used_for}; bucket policy contains {', '.join(reasons)}",
+                "this account's principals stop matching the condition once the org id "
+                "changes - grant the account explicitly, or update the condition to the "
+                "target organization",
+            )
+
+    def check_key_policy(self, key_id: str, used_for: str) -> None:
+        if key_id.startswith("alias/aws/"):
+            return  # AWS-managed key, no customer policy to break
+        if f"kms:{key_id}" in self._seen_targets:
+            return
+        self._seen_targets.add(f"kms:{key_id}")
+        try:
+            policy = self.client("kms").get_key_policy(KeyId=key_id, PolicyName="default")["Policy"]
+        except (ClientError, BotoCoreError) as err:
+            self.unchecked("kms-key-policy", f"kms/{key_id}", err)
+            return
+
+        reasons = org_references(policy)
+        if reasons:
+            self.add(
+                MUST_FIX,
+                "kms-key-policy",
+                f"kms/{key_id}",
+                f"{used_for}; key policy contains {', '.join(reasons)}",
+                "kms:Decrypt/GenerateDataKey from this account starts returning "
+                "AccessDenied once the org id changes - grant the account explicitly, "
+                "or update the condition to the target organization",
+            )
 
     # -- checks -----------------------------------------------------------
 
-    def check_documents(self) -> None:
-        """Self-owned documents: inventory, sharing, and embedded org/OU ids."""
+    def check_document_content(self) -> None:
+        """Self-owned documents whose body hardcodes the current org or its OUs."""
         try:
             docs = list(
                 self.paginate(
@@ -153,99 +192,32 @@ class Auditor:
                 )
             )
         except (ClientError, BotoCoreError) as err:
-            self.skipped("documents", err)
+            self.unchecked("document-content", "documents owned by this account", err)
             return
 
-        self.add(
-            "INFO",
-            "documents",
-            f"{len(docs)} document(s) owned by this account",
-            "documents are account-scoped and survive the migration untouched, "
-            "including versions, default version and tags",
-            "no action needed for the documents themselves",
-        )
-
+        self.document_count = len(docs)
         ssm = self.client("ssm")
         for doc in docs:
             name = doc["Name"]
             self.log(f"document {name}")
-
-            # Sharing: account ids survive, but in-org targets become external.
-            try:
-                perm = ssm.describe_document_permission(Name=name, PermissionType="Share")
-                shared = perm.get("AccountIds", [])
-            except (ClientError, BotoCoreError):
-                shared = []
-
-            if "all" in [s.lower() for s in shared]:
-                self.add(
-                    "MEDIUM",
-                    "document-sharing",
-                    f"document/{name}",
-                    "shared publicly (All) - public sharing is independent of the "
-                    "organization and stays public after the move",
-                    "confirm the target organization allows public document sharing, "
-                    "or unshare before migrating",
-                )
-            elif shared:
-                in_org = sorted(set(shared) & self.org_account_ids)
-                if in_org:
-                    self.add(
-                        "MEDIUM",
-                        "document-sharing",
-                        f"document/{name}",
-                        "shared with account(s) in the current organization: "
-                        + ", ".join(in_org)
-                        + " - sharing survives, but becomes cross-organization",
-                        "decide whether those accounts should still have access once "
-                        "the account sits in a different organization",
-                    )
-                else:
-                    self.add(
-                        "LOW",
-                        "document-sharing",
-                        f"document/{name}",
-                        "shared with " + ", ".join(sorted(shared)),
-                        "sharing is by explicit account id, so it survives the move",
-                    )
-
-            # Content referencing the current org (automation target locations etc).
             try:
                 content = ssm.get_document(Name=name)["Content"]
-            except (ClientError, BotoCoreError):
+            except (ClientError, BotoCoreError) as err:
+                self.unchecked("document-content", f"document/{name}", err)
                 continue
             reasons = org_references(content)
             if reasons:
                 self.add(
-                    "HIGH",
+                    MUST_FIX,
                     "document-content",
                     f"document/{name}",
-                    "document body is pinned to the current organization: "
-                    + "; ".join(reasons),
-                    "rewrite the document for the target organization id / OU ids "
-                    "before or immediately after the move",
+                    "document body contains " + ", ".join(reasons),
+                    "the document resolves against the current organization - rewrite it "
+                    "for the target organization before it is next executed",
                 )
 
-    def check_public_sharing_setting(self) -> None:
-        try:
-            setting = self.client("ssm").get_service_setting(
-                SettingId="/ssm/documents/console/public-sharing-permission"
-            )["ServiceSetting"]
-        except (ClientError, BotoCoreError) as err:
-            self.skipped("public-sharing-setting", err)
-            return
-        value = setting.get("SettingValue", "")
-        if value == "Enable":
-            self.add(
-                "LOW",
-                "public-sharing-setting",
-                "/ssm/documents/console/public-sharing-permission",
-                "public document sharing is allowed in this account",
-                "the target organization may forbid this via SCP; align the setting "
-                "with the new organization's baseline",
-            )
-
     def check_resource_data_syncs(self) -> None:
+        """Org-sourced syncs, and the destinations every sync actually writes to."""
         for sync_type in ("SyncToDestination", "SyncFromSource"):
             try:
                 syncs = list(
@@ -257,39 +229,45 @@ class Auditor:
                     )
                 )
             except (ClientError, BotoCoreError) as err:
-                self.skipped(f"resource-data-sync/{sync_type}", err)
+                self.unchecked("resource-data-sync", f"syncs of type {sync_type}", err)
                 continue
 
             for sync in syncs:
                 name = sync.get("SyncName", "?")
                 source = sync.get("SyncSource") or {}
-                source_type = source.get("SourceType", "")
-                if source_type == "AwsOrganizations":
-                    detail = "aggregates inventory from the current organization"
-                    if source.get("AwsOrganizationsSource", {}).get("OrganizationSourceType"):
-                        detail += (
-                            f" ({source['AwsOrganizationsSource']['OrganizationSourceType']})"
-                        )
+                if source.get("SourceType") == "AwsOrganizations":
+                    org_source = source.get("AwsOrganizationsSource", {}) or {}
+                    detail = "SyncSource.SourceType is AwsOrganizations"
+                    if org_source.get("OrganizationSourceType"):
+                        detail += f" ({org_source['OrganizationSourceType']})"
+                    if org_source.get("OrganizationalUnits"):
+                        units = [
+                            u.get("OrganizationalUnitId", "")
+                            for u in org_source["OrganizationalUnits"]
+                        ]
+                        detail += " over " + ", ".join(filter(None, units))
                     self.add(
-                        "HIGH",
+                        MUST_FIX,
                         "resource-data-sync",
                         f"resource-data-sync/{name}",
-                        detail + " - breaks the moment the organization changes",
-                        "delete and recreate the sync against the target organization",
-                    )
-                else:
-                    bucket = (sync.get("S3Destination") or {}).get("BucketName", "")
-                    self.add(
-                        "LOW",
-                        "resource-data-sync",
-                        f"resource-data-sync/{name}",
-                        f"{sync_type} sync"
-                        + (f" to bucket {bucket}" if bucket else ""),
-                        "check the destination bucket/KMS policy for organization "
-                        "conditions (reported separately if reachable)",
+                        detail,
+                        "the sync is bound to the current organization and stops "
+                        "aggregating on the move - delete and recreate it against the "
+                        "target organization",
                     )
 
-    def check_delegated_administrators(self) -> None:
+                destination = sync.get("S3Destination") or {}
+                if destination.get("BucketName"):
+                    self.check_bucket_policy(
+                        destination["BucketName"], f"Resource Data Sync '{name}' destination"
+                    )
+                if destination.get("AWSKMSKeyARN"):
+                    self.check_key_policy(
+                        destination["AWSKMSKeyARN"], f"Resource Data Sync '{name}' destination"
+                    )
+
+    def check_delegated_administrator(self) -> None:
+        """Only matters if THIS account is the SSM delegated admin."""
         try:
             admins = list(
                 self.paginate(
@@ -300,21 +278,27 @@ class Auditor:
                 )
             )
         except (ClientError, BotoCoreError) as err:
-            self.skipped("delegated-administrator", err)
+            self.unchecked(
+                "delegated-administrator", "ssm.amazonaws.com delegated admin", err
+            )
             return
+
         for admin in admins:
-            severity = "HIGH" if admin["Id"] == self.account_id else "INFO"
+            if admin["Id"] != self.account_id:
+                continue  # someone else's problem
             self.add(
-                severity,
+                MUST_FIX,
                 "delegated-administrator",
                 f"account/{admin['Id']}",
-                "delegated administrator for ssm.amazonaws.com"
-                + (" - this is the account being migrated" if severity == "HIGH" else ""),
-                "register a delegated administrator in the target organization; "
-                "Change Manager and Explorer aggregation stop working until then",
+                "this account is the delegated administrator for ssm.amazonaws.com "
+                f"in {self.org_id or 'the current organization'}",
+                "the registration is lost on the move - hand the role to another "
+                "account before migrating, and register a delegated admin in the "
+                "target organization",
             )
 
     def check_vpc_endpoints(self) -> None:
+        """Policies on the SSM data-plane endpoints, matched by service name."""
         try:
             endpoints = list(
                 self.paginate(
@@ -325,191 +309,113 @@ class Auditor:
                 )
             )
         except (ClientError, BotoCoreError) as err:
-            self.skipped("vpc-endpoints", err)
+            self.unchecked("vpc-endpoint-policy", "ssm/ssmmessages/ec2messages endpoints", err)
             return
 
         for endpoint in endpoints:
             service = endpoint.get("ServiceName", "")
             if not service.endswith(SSM_ENDPOINT_SUFFIXES):
                 continue
-            policy = endpoint.get("PolicyDocument") or ""
-            reasons = org_references(policy)
+            reasons = org_references(endpoint.get("PolicyDocument") or "")
             if reasons:
                 self.add(
-                    "HIGH",
+                    MUST_FIX,
                     "vpc-endpoint-policy",
                     f"{endpoint['VpcEndpointId']} ({service})",
-                    "endpoint policy is pinned to the current organization: "
-                    + "; ".join(reasons),
-                    "update the policy for the new organization id, otherwise "
-                    "Session Manager / SSM Agent traffic is denied after the move",
+                    "endpoint policy contains " + ", ".join(reasons),
+                    "SSM Agent and Session Manager traffic from this account is denied "
+                    "once the org id changes - update the policy to the target "
+                    "organization before migrating",
                 )
 
     def check_session_manager_targets(self) -> None:
-        """Session Manager log bucket + KMS key policies."""
+        """Log bucket and CMK configured in SSM-SessionManagerRunShell."""
         try:
             content = self.client("ssm").get_document(Name="SSM-SessionManagerRunShell")["Content"]
             inputs = json.loads(content).get("inputs", {})
-        except (ClientError, BotoCoreError, ValueError) as err:
-            self.skipped("session-manager-preferences", err)
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") == "InvalidDocument":
+                return  # preferences never customised - nothing configured to break
+            self.unchecked("session-manager", "SSM-SessionManagerRunShell", err)
+            return
+        except (BotoCoreError, ValueError) as err:
+            self.unchecked("session-manager", "SSM-SessionManagerRunShell", err)
             return
 
-        bucket = inputs.get("s3BucketName") or ""
-        if bucket:
-            self.check_bucket_policy(bucket, "Session Manager session logs")
-        key_id = inputs.get("kmsKeyId") or ""
-        if key_id:
-            self.check_key_policy(key_id, "Session Manager encryption")
+        if inputs.get("s3BucketName"):
+            self.check_bucket_policy(inputs["s3BucketName"], "Session Manager session logs")
+        if inputs.get("kmsKeyId"):
+            self.check_key_policy(inputs["kmsKeyId"], "Session Manager session encryption")
 
-    def check_bucket_policy(self, bucket: str, purpose: str) -> None:
+    def check_securestring_keys(self) -> None:
+        """CMKs behind SecureString parameters - the deferred-failure path.
+
+        Nothing breaks at migration time; the next GetParameter WithDecryption
+        after a restart or scale-out does.
+        """
         try:
-            policy = self.client("s3").get_bucket_policy(Bucket=bucket)["Policy"]
+            params = list(self.paginate("ssm", "describe_parameters", "Parameters"))
         except (ClientError, BotoCoreError) as err:
-            self.skipped(f"bucket-policy/{bucket}", err)
-            return
-        reasons = org_references(policy)
-        if reasons:
-            self.add(
-                "HIGH",
-                "bucket-policy",
-                f"s3://{bucket}",
-                f"{purpose} bucket policy is pinned to the current organization: "
-                + "; ".join(reasons),
-                "update the policy for the new organization id before the move, "
-                "or writes from this account start failing with AccessDenied",
-            )
-
-    def check_key_policy(self, key_id: str, purpose: str) -> None:
-        try:
-            policy = self.client("kms").get_key_policy(KeyId=key_id, PolicyName="default")["Policy"]
-        except (ClientError, BotoCoreError) as err:
-            self.skipped(f"kms-key-policy/{key_id}", err)
-            return
-        reasons = org_references(policy)
-        if reasons:
-            self.add(
-                "HIGH",
-                "kms-key-policy",
-                f"kms/{key_id}",
-                f"{purpose} key policy is pinned to the current organization: "
-                + "; ".join(reasons),
-                "grant the account explicitly, or update the organization condition "
-                "for the target organization",
-            )
-
-    def check_service_managed_stacks(self) -> None:
-        """Stack instances pushed from the org - Quick Setup rides on these."""
-        try:
-            stacks = list(
-                self.paginate(
-                    "cloudformation",
-                    "list_stacks",
-                    "StackSummaries",
-                    StackStatusFilter=[
-                        "CREATE_COMPLETE",
-                        "UPDATE_COMPLETE",
-                        "UPDATE_ROLLBACK_COMPLETE",
-                        "IMPORT_COMPLETE",
-                    ],
-                )
-            )
-        except (ClientError, BotoCoreError) as err:
-            self.skipped("service-managed-stacks", err)
+            self.unchecked("securestring-key", "SecureString parameters", err)
             return
 
-        for stack in stacks:
-            name = stack["StackName"]
-            if not name.startswith("StackSet-"):
+        keys: dict[str, list[str]] = {}
+        for param in params:
+            if param.get("Type") != "SecureString":
                 continue
-            severity = "MEDIUM"
-            note = "stack instance deployed from an organization StackSet"
-            if any(p in name for p in QUICK_SETUP_PREFIXES):
-                severity = "HIGH"
-                note = "SSM Quick Setup stack instance deployed from an organization StackSet"
-            self.add(
-                severity,
-                "service-managed-stack",
-                f"stack/{name}",
-                note
-                + " - leaving the OU removes or orphans it, taking its SSM "
-                "associations and roles with it",
-                "re-deploy the equivalent configuration from the target organization "
-                "after the move",
-            )
+            key_id = param.get("KeyId", "")
+            if not key_id or key_id.startswith("alias/aws/"):
+                continue  # AWS-managed key, no customer policy to break
+            keys.setdefault(key_id, []).append(param["Name"])
 
-    def check_associations(self) -> None:
-        try:
-            associations = list(
-                self.paginate("ssm", "list_associations", "Associations")
+        for key_id, names in keys.items():
+            self.log(f"securestring key {key_id} ({len(names)} parameter(s))")
+            sample = ", ".join(sorted(names)[:3])
+            if len(names) > 3:
+                sample += f", +{len(names) - 3} more"
+            self.check_key_policy(
+                key_id, f"{len(names)} SecureString parameter(s) ({sample})"
             )
-        except (ClientError, BotoCoreError) as err:
-            self.skipped("associations", err)
-            return
-
-        for assoc in associations:
-            name = assoc.get("Name", "")
-            assoc_name = assoc.get("AssociationName", "") or assoc.get("AssociationId", "")
-            if any(name.startswith(p) or assoc_name.startswith(p) for p in QUICK_SETUP_PREFIXES):
-                self.add(
-                    "HIGH",
-                    "quick-setup-association",
-                    f"association/{assoc_name} ({name})",
-                    "created by Quick Setup from the organization management account",
-                    "expect it to disappear with its StackSet; re-provision host "
-                    "management / patching from the target organization",
-                )
 
     # -- driver -----------------------------------------------------------
 
     def run(self) -> list[Finding]:
         self.load_context()
         for check in (
-            self.check_documents,
-            self.check_public_sharing_setting,
+            self.check_document_content,
             self.check_resource_data_syncs,
-            self.check_delegated_administrators,
+            self.check_delegated_administrator,
             self.check_vpc_endpoints,
             self.check_session_manager_targets,
-            self.check_service_managed_stacks,
-            self.check_associations,
+            self.check_securestring_keys,
         ):
             self.log(f"running {check.__name__}")
             try:
                 check()
             except (ClientError, BotoCoreError) as err:  # defensive
-                self.skipped(check.__name__, err)
+                self.unchecked(check.__name__, "-", err)
         return self.findings
-
-
-SEVERITY_BLURB = {
-    "HIGH": "Fix before the move. These fail closed: the affected calls start "
-    "returning AccessDenied, or the configuration disappears with its StackSet.",
-    "MEDIUM": "Decide before the move. Nothing breaks on its own, but the blast "
-    "radius or the audience changes once the account sits in a different organization.",
-    "LOW": "Informational risk. Worth a look while aligning with the target "
-    "organization's baseline.",
-    "INFO": "Context and skipped checks. A skipped check is a blind spot, not a "
-    "clean result.",
-}
 
 
 def md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def render_markdown(findings: list[Finding], meta: dict[str, str]) -> str:
-    findings = sorted(findings, key=lambda f: (SEVERITY_ORDER[f.severity], f.region, f.check))
-    counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
-    skipped = [f for f in findings if f.check and "check skipped" in f.detail]
+def render_markdown(
+    findings: list[Finding], meta: dict[str, str], regions: list[str] | None = None
+) -> str:
+    """One section per region, listing what has to be fixed there."""
+    if regions is None:
+        regions = list(dict.fromkeys(f.region for f in findings))
+
+    must_fix = [f for f in findings if f.severity == MUST_FIX]
 
     out: list[str] = []
     out.append("# SSM organization-migration readiness report")
     out.append("")
     out.append(
-        "Read-only audit of Systems Manager configuration that breaks when this AWS "
-        "account is moved to a different AWS Organization. SSM documents themselves "
-        "survive the move untouched — the account ID does not change. Everything below "
-        "is about configuration tied to the *organization*."
+        "Every item below was read from the live resource named in it, and every one "
+        "of them has to be resolved before this account changes organization."
     )
     out.append("")
 
@@ -523,75 +429,45 @@ def render_markdown(findings: list[Finding], meta: dict[str, str]) -> str:
         ("Current organization", "org_id"),
         ("Profile", "profile"),
         ("Regions", "regions"),
+        ("SSM documents owned", "document_count"),
+        ("Items to fix", "-"),
     ):
-        out.append(f"| {label} | {md_escape(meta.get(key) or '-')} |")
+        value = str(len(must_fix)) if key == "-" else meta.get(key) or "-"
+        out.append(f"| {label} | {md_escape(value)} |")
     out.append("")
 
-    out.append("## Summary")
-    out.append("")
-    out.append("| Severity | Findings |")
-    out.append("| --- | --- |")
-    for sev in SEVERITY_ORDER:
-        out.append(f"| {sev} | {counts[sev]} |")
-    out.append("")
-    if counts["HIGH"]:
-        out.append(
-            f"**{counts['HIGH']} blocking finding(s).** Do not start the migration "
-            "until each one below is resolved or explicitly accepted."
-        )
-    else:
-        out.append(
-            "**No blocking findings.** Note that the target organization's SCPs are "
-            "not visible from this account and are not covered by this report."
-        )
-    out.append("")
-
-    for sev in SEVERITY_ORDER:
-        rows = [f for f in findings if f.severity == sev]
-        if not rows:
-            continue
-        out.append(f"## {sev}")
+    for region in regions:
+        out.append(f"## {region}")
         out.append("")
-        out.append(f"_{SEVERITY_BLURB[sev]}_")
-        out.append("")
-        out.append("| Check | Region | Resource | Finding | Action |")
-        out.append("| --- | --- | --- | --- | --- |")
-        for f in rows:
-            out.append(
-                f"| `{md_escape(f.check)}` | {md_escape(f.region)} "
-                f"| `{md_escape(f.resource)}` | {md_escape(f.detail)} "
-                f"| {md_escape(f.action)} |"
-            )
-        out.append("")
+        region_fixes = [f for f in must_fix if f.region == region]
+        region_unchecked = [
+            f for f in findings if f.region == region and f.severity == UNCHECKED
+        ]
 
-    out.append("## Not covered by this report")
-    out.append("")
-    out.append(
-        "- **SCPs of the target organization.** They apply the instant the account is "
-        "invited, and no API exposes them from the source account. Diff the two "
-        "organizations' policies by hand."
-    )
-    out.append(
-        "- **Organization references in infrastructure code.** Grep the Terraform: "
-        "`grep -rE 'PrincipalOrgID|ResourceOrgID|\\bo-[a-z0-9]{10,}' <infra-repo>`"
-    )
-    if skipped:
-        out.append(
-            f"- **{len(skipped)} check(s) skipped** for lack of permissions or "
-            "unreachable resources, listed under INFO above. Treat them as blind spots."
-        )
-    out.append("")
+        if region_fixes:
+            out.append("| Resource | What is wrong | Fix |")
+            out.append("| --- | --- | --- |")
+            for f in region_fixes:
+                out.append(
+                    f"| `{md_escape(f.resource)}` | {md_escape(f.evidence)} "
+                    f"| {md_escape(f.action)} |"
+                )
+            out.append("")
+        elif not region_unchecked:
+            out.append("Nothing to fix.")
+            out.append("")
+        else:
+            out.append("Nothing to fix in what could be read.")
+            out.append("")
 
-    out.append("## Suggested order of work")
-    out.append("")
-    out.append("1. Resolve every HIGH finding above.")
-    out.append("2. Diff source and target organization SCPs.")
-    out.append("3. Perform the migration.")
-    out.append(
-        "4. Re-run this audit with `--fail-on medium` and re-provision Quick Setup "
-        "and Resource Data Sync from the new organization."
-    )
-    out.append("")
+        if region_unchecked:
+            out.append("### Could not be read")
+            out.append("")
+            out.append("| Resource | Error |")
+            out.append("| --- | --- |")
+            for f in region_unchecked:
+                out.append(f"| `{md_escape(f.resource)}` | {md_escape(f.evidence)} |")
+            out.append("")
 
     return "\n".join(out)
 
@@ -601,36 +477,35 @@ def render(findings: list[Finding], as_json: bool) -> None:
         print(json.dumps([asdict(f) for f in findings], indent=2))
         return
 
-    findings = sorted(findings, key=lambda f: (SEVERITY_ORDER[f.severity], f.region, f.check))
-    current = None
-    for finding in findings:
-        if finding.severity != current:
-            current = finding.severity
-            print(f"\n=== {current} ===")
-        print(f"[{finding.region}] {finding.check}: {finding.resource}")
-        print(f"    {finding.detail}")
-        print(f"    -> {finding.action}")
+    if not findings:
+        print("nothing to fix: every check ran and came back clean")
+        return
 
-    counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
-    print(
-        "\nsummary: "
-        + ", ".join(f"{sev.lower()}={counts[sev]}" for sev in SEVERITY_ORDER)
-    )
+    must_fix = [f for f in findings if f.severity == MUST_FIX]
+    for region in dict.fromkeys(f.region for f in findings):
+        print(f"\n=== {region} ===")
+        region_fixes = [f for f in must_fix if f.region == region]
+        if not region_fixes:
+            print("nothing to fix")
+        for finding in region_fixes:
+            print(f"{finding.check}: {finding.resource}")
+            print(f"    wrong: {finding.evidence}")
+            print(f"    fix:   {finding.action}")
+        for finding in [f for f in findings if f.region == region and f.severity == UNCHECKED]:
+            print(f"could not read {finding.resource}: {finding.evidence}")
+
+    print(f"\n{len(must_fix)} item(s) to fix before the migration")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Audit SSM configuration that breaks when an AWS account "
-        "moves to a different AWS Organization (read-only).",
+        description="Audit SSM configuration that must be fixed before an AWS account "
+        "moves to a different AWS Organization (read-only, evidence-based).",
     )
-    parser.add_argument(
-        "--profile",
-        help="AWS named profile to use (default: the usual credential chain)",
-    )
+    parser.add_argument("--profile", help="AWS named profile (default: credential chain)")
     parser.add_argument(
         "--region",
-        help="Region, or comma-separated regions, to audit "
-        "(default: the profile's configured region)",
+        help="Region, or comma-separated regions (default: the profile's region)",
     )
     parser.add_argument("--json", action="store_true", help="emit findings as JSON")
     parser.add_argument(
@@ -638,16 +513,15 @@ def main() -> int:
         nargs="?",
         const="ssm-migration-report.md",
         metavar="PATH",
-        help="also write a Markdown report (default path: ssm-migration-report.md; "
-        "use '-' to print it to stdout instead of the text report)",
+        help="also write a Markdown report (default: ssm-migration-report.md; "
+        "'-' prints it to stdout instead of the text report)",
     )
     parser.add_argument("--verbose", action="store_true", help="log progress to stderr")
     parser.add_argument(
         "--fail-on",
-        choices=["high", "medium", "low", "never"],
-        default="high",
-        help="exit non-zero when a finding of this severity or worse exists "
-        "(default: high)",
+        choices=["must-fix", "unchecked", "never"],
+        default="must-fix",
+        help="exit non-zero on findings at this level or worse (default: must-fix)",
     )
     args = parser.parse_args()
 
@@ -661,7 +535,7 @@ def main() -> int:
     elif session.region_name:
         regions = [session.region_name]
     else:
-        return int(bool(sys.stderr.write("no region: pass --region or configure the profile\n")))
+        raise SystemExit("no region: pass --region or configure the profile")
 
     findings: list[Finding] = []
     auditors: list[Auditor] = []
@@ -679,8 +553,9 @@ def main() -> int:
             "org_id": next((a.org_id for a in auditors if a.org_id), "not readable from this account"),
             "profile": args.profile or "default credential chain",
             "regions": ", ".join(regions),
+            "document_count": str(sum(a.document_count for a in auditors)),
         }
-        report = render_markdown(findings, meta)
+        report = render_markdown(findings, meta, regions)
         if args.markdown == "-":
             print(report)
         else:
@@ -693,7 +568,7 @@ def main() -> int:
 
     if args.fail_on == "never":
         return 0
-    threshold = SEVERITY_ORDER[args.fail_on.upper()]
+    threshold = SEVERITY_ORDER[MUST_FIX if args.fail_on == "must-fix" else UNCHECKED]
     return 1 if any(SEVERITY_ORDER[f.severity] <= threshold for f in findings) else 0
 
 
