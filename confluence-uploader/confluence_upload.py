@@ -26,7 +26,6 @@ import argparse
 import mimetypes
 import os
 import re
-import ssl
 import sys
 import textwrap
 from datetime import date
@@ -37,9 +36,7 @@ import html as html_mod
 from html.parser import HTMLParser
 
 try:
-    import certifi
     import requests
-    from requests.adapters import HTTPAdapter
     from requests.auth import HTTPBasicAuth
 except ImportError:  # pragma: no cover
     sys.exit("Missing dependency: pip install requests")
@@ -466,24 +463,6 @@ def file_to_storage(path: Path) -> tuple[str, list[Path]]:
 # Confluence Cloud REST client
 # --------------------------------------------------------------------------- #
 
-class _ExtraCAAdapter(HTTPAdapter):
-    """Trusts an extra CA bundle *in addition to* the public roots.
-
-    Plain `verify=<file>` would replace them, which breaks every request made
-    from outside the network that needs the corporate CA.
-    """
-
-    def __init__(self, ca_bundle: str, **kwargs: Any) -> None:
-        self._ca_bundle = ca_bundle
-        super().__init__(**kwargs)
-
-    def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
-        context = ssl.create_default_context(cafile=certifi.where())
-        context.load_verify_locations(cafile=self._ca_bundle)
-        kwargs["ssl_context"] = context
-        return super().init_poolmanager(*args, **kwargs)
-
-
 class _Session(requests.Session):
     """A session that turns TLS failures into an explanation instead of a traceback."""
 
@@ -511,7 +490,9 @@ class Confluence:
         self.s.auth = HTTPBasicAuth(user, token)
         self.s.headers["Accept"] = "application/json"
         if ca_bundle:
-            self.s.mount("https://", _ExtraCAAdapter(ca_bundle))
+            # trust exactly this bundle - it must contain every CA the script
+            # needs to reach Confluence from wherever it runs
+            self.s.verify = ca_bundle
 
     def _check(self, r: requests.Response) -> Any:
         if not r.ok:

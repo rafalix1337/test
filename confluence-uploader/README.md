@@ -171,10 +171,13 @@ python3 confluence_upload.py ... --ca-bundle /path/to/corporate-root-ca.pem
 
 To avoid passing it every time, set the path once in `DEFAULT_CA_BUNDLE` at the
 top of the script, or export `REQUESTS_CA_BUNDLE`; `--ca-bundle` overrides both.
+Use an **absolute path** — a relative one is resolved against the directory you
+run the script from.
 
-The bundle is *added* to the public roots rather than replacing them, so the
-same setting keeps working off the corporate network. Verification itself is
-never weakened — there is no option to disable it.
+The bundle *replaces* the public root store for this connection, so it has to
+contain every CA needed to reach Confluence from wherever the script runs. A
+keychain dump as shown below already includes the public roots. Verification
+itself is never weakened — there is no option to disable it.
 
 On macOS the company root CA can usually be exported from Keychain Access, or
 dumped with:
