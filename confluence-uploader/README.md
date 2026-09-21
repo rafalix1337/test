@@ -159,6 +159,34 @@ Details worth knowing:
 - **Exit code.** `0` when nothing failed, `1` otherwise. Skipped files are not
   failures.
 
+## TLS behind a corporate proxy
+
+If the upload fails with `SSL: CERTIFICATE_VERIFY_FAILED`, your network is most
+likely inspecting TLS traffic and presenting its own CA. Two flags cover it:
+
+```bash
+# 1. trust your company root CA
+python3 confluence_upload.py ... --ca-bundle /path/to/corporate-root-ca.pem
+#    equivalent: export REQUESTS_CA_BUNDLE=/path/to/corporate-root-ca.pem
+
+# 2. if the error mentions a strict check, e.g.
+#    "basic constraints of CA cert not marked critical"
+python3 confluence_upload.py ... --relaxed-tls
+```
+
+`--relaxed-tls` is needed because Python 3.13 turned on `VERIFY_X509_STRICT` by
+default, and many inspection-proxy CAs are not strictly RFC 5280 compliant. It
+drops only that strictness check — the certificate chain, hostname and expiry are
+still verified, so a self-signed or mismatched certificate is still rejected.
+There is no option to disable verification altogether.
+
+On macOS the company root CA can usually be exported from Keychain Access, or
+dumped with:
+
+```bash
+security find-certificate -a -p /Library/Keychains/System.keychain > corporate-ca.pem
+```
+
 ## Options
 
 ```
@@ -176,6 +204,8 @@ Details worth knowing:
     --attachments         upload non-document files as attachments
     --lookup TITLE        print the page id + URL for TITLE and exit
     --user EMAIL          Atlassian account email (or $CONFLUENCE_USER)
+    --ca-bundle FILE      CA bundle to trust (or $REQUESTS_CA_BUNDLE)
+    --relaxed-tls         skip strict RFC 5280 checks, keep verification
     --version-message MSG version comment recorded on updates
     --dry-run             print planned actions, make no API calls
 ```
