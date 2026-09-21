@@ -162,23 +162,19 @@ Details worth knowing:
 ## TLS behind a corporate proxy
 
 If the upload fails with `SSL: CERTIFICATE_VERIFY_FAILED`, your network is most
-likely inspecting TLS traffic and presenting its own CA. Two flags cover it:
+likely inspecting TLS traffic and presenting its own CA, which the public root
+store does not know. Point the script at that CA:
 
 ```bash
-# 1. trust your company root CA
 python3 confluence_upload.py ... --ca-bundle /path/to/corporate-root-ca.pem
-#    equivalent: export REQUESTS_CA_BUNDLE=/path/to/corporate-root-ca.pem
-
-# 2. if the error mentions a strict check, e.g.
-#    "basic constraints of CA cert not marked critical"
-python3 confluence_upload.py ... --relaxed-tls
 ```
 
-`--relaxed-tls` is needed because Python 3.13 turned on `VERIFY_X509_STRICT` by
-default, and many inspection-proxy CAs are not strictly RFC 5280 compliant. It
-drops only that strictness check — the certificate chain, hostname and expiry are
-still verified, so a self-signed or mismatched certificate is still rejected.
-There is no option to disable verification altogether.
+To avoid passing it every time, set the path once in `DEFAULT_CA_BUNDLE` at the
+top of the script, or export `REQUESTS_CA_BUNDLE`; `--ca-bundle` overrides both.
+
+The bundle is *added* to the public roots rather than replacing them, so the
+same setting keeps working off the corporate network. Verification itself is
+never weakened — there is no option to disable it.
 
 On macOS the company root CA can usually be exported from Keychain Access, or
 dumped with:
@@ -204,8 +200,7 @@ security find-certificate -a -p /Library/Keychains/System.keychain > corporate-c
     --attachments         upload non-document files as attachments
     --lookup TITLE        print the page id + URL for TITLE and exit
     --user EMAIL          Atlassian account email (or $CONFLUENCE_USER)
-    --ca-bundle FILE      CA bundle to trust (or $REQUESTS_CA_BUNDLE)
-    --relaxed-tls         skip strict RFC 5280 checks, keep verification
+    --ca-bundle FILE      CA bundle to trust (default: DEFAULT_CA_BUNDLE / $REQUESTS_CA_BUNDLE)
     --version-message MSG version comment recorded on updates
     --dry-run             print planned actions, make no API calls
 ```

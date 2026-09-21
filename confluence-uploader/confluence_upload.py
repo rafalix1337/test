@@ -65,6 +65,11 @@ DEFAULT_SPACE_KEY = os.environ.get("CONFLUENCE_SPACE", "YOURSPACE")
 # created manually for that account. Empty = top level of the space.
 DEFAULT_PARENT_TITLE = os.environ.get("CONFLUENCE_PARENT", "{account_id}")
 
+# CA bundle used to verify the TLS connection - set this to your corporate root
+# CA if your network inspects TLS traffic. Empty = the public roots only.
+# $REQUESTS_CA_BUNDLE and --ca-bundle override it. "~" is expanded.
+DEFAULT_CA_BUNDLE = os.environ.get("REQUESTS_CA_BUNDLE", "confluence.crt")
+
 # Confluence Cloud authenticates with your account email + an API token: the
 # token acts as the password for that account, so both are needed.
 TOKEN_ENV = "CONFLUENCE_API_TOKEN"
@@ -461,26 +466,20 @@ def file_to_storage(path: Path) -> tuple[str, list[Path]]:
 # Confluence Cloud REST client
 # --------------------------------------------------------------------------- #
 
-class _RelaxedTLSAdapter(HTTPAdapter):
-    """Full certificate verification, minus the strict RFC 5280 checks.
+class _ExtraCAAdapter(HTTPAdapter):
+    """Trusts an extra CA bundle *in addition to* the public roots.
 
-    Python 3.13+ turns on VERIFY_X509_STRICT by default. Many TLS-inspection
-    proxies use a root CA whose basicConstraints extension is not marked
-    critical, which that flag rejects. The chain, hostname and expiry are still
-    verified here - only the strictness check is dropped.
+    Plain `verify=<file>` would replace them, which breaks every request made
+    from outside the network that needs the corporate CA.
     """
 
-    def __init__(self, ca_bundle: str | None = None, **kwargs: Any) -> None:
+    def __init__(self, ca_bundle: str, **kwargs: Any) -> None:
         self._ca_bundle = ca_bundle
         super().__init__(**kwargs)
 
     def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
-        # trust the public roots as well, so --ca-bundle adds a CA instead of
-        # replacing every other one
         context = ssl.create_default_context(cafile=certifi.where())
-        if self._ca_bundle:
-            context.load_verify_locations(cafile=self._ca_bundle)
-        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        context.load_verify_locations(cafile=self._ca_bundle)
         kwargs["ssl_context"] = context
         return super().init_poolmanager(*args, **kwargs)
 
@@ -495,16 +494,13 @@ class _Session(requests.Session):
             raise SystemExit(
                 f"TLS verification failed: {exc}\n\n"
                 "If your network inspects TLS traffic, point --ca-bundle at your company root CA "
-                "certificate (or export $REQUESTS_CA_BUNDLE).\n"
-                "If the message mentions a strict check such as 'basic constraints of CA cert not "
-                "marked critical', add --relaxed-tls: Python 3.13+ enforces RFC 5280 strictly and "
-                "many proxy CAs violate it."
+                "certificate, or set DEFAULT_CA_BUNDLE in this script."
             ) from exc
 
 
 class Confluence:
     def __init__(self, base_url: str, token: str, user: str | None, timeout: int = 30,
-                 ca_bundle: str | None = None, relaxed_tls: bool = False):
+                 ca_bundle: str | None = None):
         if not user:
             raise SystemExit(f"Missing ${USER_ENV} - Confluence Cloud needs your account email next "
                              f"to the token. Export it or pass --user.")
@@ -514,10 +510,8 @@ class Confluence:
         self.s = _Session()
         self.s.auth = HTTPBasicAuth(user, token)
         self.s.headers["Accept"] = "application/json"
-        if relaxed_tls:
-            self.s.mount("https://", _RelaxedTLSAdapter(ca_bundle))
-        elif ca_bundle:
-            self.s.verify = ca_bundle
+        if ca_bundle:
+            self.s.mount("https://", _ExtraCAAdapter(ca_bundle))
 
     def _check(self, r: requests.Response) -> Any:
         if not r.ok:
@@ -639,12 +633,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lookup", metavar="TITLE", help="print the page id + URL for TITLE in --space and exit")
     p.add_argument("--user", default=os.environ.get(USER_ENV),
                    help=f"Atlassian account email (or ${USER_ENV})")
-    p.add_argument("--ca-bundle", default=os.environ.get("REQUESTS_CA_BUNDLE"),
+    p.add_argument("--ca-bundle", default=DEFAULT_CA_BUNDLE,
                    help="CA certificate bundle to trust, e.g. your company root CA "
-                        "(or $REQUESTS_CA_BUNDLE)")
-    p.add_argument("--relaxed-tls", action="store_true",
-                   help="keep certificate verification but skip the strict RFC 5280 checks that "
-                        "Python 3.13+ applies; workaround for TLS-inspection proxy CAs")
+                        "(default: DEFAULT_CA_BUNDLE / $REQUESTS_CA_BUNDLE)")
     p.add_argument("--version-message", default="Automated upload via confluence_upload.py")
     p.add_argument("--dry-run", action="store_true", help="print planned actions, make no API calls")
     args = p.parse_args(argv)
@@ -665,8 +656,12 @@ def main(argv: list[str] | None = None) -> int:
     if "YOUR-DOMAIN" in args.base_url and not args.dry_run:
         raise SystemExit("Set a real --base-url (or $CONFLUENCE_BASE_URL) - the placeholder is still in place.")
 
-    api = None if args.dry_run else Confluence(args.base_url, token, args.user,
-                                               ca_bundle=args.ca_bundle, relaxed_tls=args.relaxed_tls)
+    ca_bundle = str(Path(args.ca_bundle).expanduser()) if args.ca_bundle else None
+    if ca_bundle and not Path(ca_bundle).is_file():
+        raise SystemExit(f"CA bundle {ca_bundle} does not exist. Fix DEFAULT_CA_BUNDLE in this "
+                         f"script, $REQUESTS_CA_BUNDLE, or --ca-bundle.")
+
+    api = None if args.dry_run else Confluence(args.base_url, token, args.user, ca_bundle=ca_bundle)
 
     if args.lookup:
         if not api:
