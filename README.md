@@ -1,4 +1,5 @@
 # arn_delete.py
+d=~/migration_${ACCOUNT_ID}_$(date +%m_%d_%Y); mkdir -p "$d" && script -q -f "$d/session_$(date +%H-%M-%S).log"
 
 Delete AWS resources from a list of ARNs.
 
