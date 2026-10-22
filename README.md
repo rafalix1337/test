@@ -1,6 +1,8 @@
 # arn_delete.py
 perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e\][^\a\e]*(\a|\e\\)//g; s/\e[()][A-Za-z0-9]//g; s/\e[=>]//g' session.log | col -b > session.txt
 
+_nl() { echo }; autoload -Uz add-zsh-hook; add-zsh-hook precmd _nl
+
 Delete AWS resources from a list of ARNs.
 
 ## Do you need a handler per resource type?
