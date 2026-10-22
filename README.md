@@ -1,5 +1,5 @@
 # arn_delete.py
-d=~/migration_${ACCOUNT_ID}_$(date +%m_%d_%Y); f="$d/session_$(date +%H-%M-%S)"; mkdir -p "$d" && script -q -f "$f.log"; perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e\][^\a\e]*(\a|\e\\)//g; s/\e[()][A-Za-z0-9]//g; s/\e[=>]//g' "$f.log" | col -b > "$f.txt"
+perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\e\][^\a\e]*(\a|\e\\)//g; s/\e[()][A-Za-z0-9]//g; s/\e[=>]//g' session.log | col -b > session.txt
 
 Delete AWS resources from a list of ARNs.
 
